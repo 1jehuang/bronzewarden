@@ -2,13 +2,17 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 
 use bronzewarden::api::BitwardenApi;
+use bronzewarden::api::SyncResponse;
 use bronzewarden::config::Config;
 use bronzewarden::crypto::{EncString, MasterKey};
 use bronzewarden::vault::Vault;
-use bronzewarden::api::SyncResponse;
 
 #[derive(Parser)]
-#[command(name = "bronzewarden", version, about = "Minimal Bitwarden vault client")]
+#[command(
+    name = "bronzewarden",
+    version,
+    about = "Minimal Bitwarden vault client"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -24,6 +28,15 @@ enum Commands {
         /// Server URL (for self-hosted)
         #[arg(long)]
         server: Option<String>,
+        /// Use API key login (set BW_CLIENTID and BW_CLIENTSECRET, or pass flags)
+        #[arg(long)]
+        apikey: bool,
+        /// API key client ID (e.g. user.xxxxx)
+        #[arg(long)]
+        client_id: Option<String>,
+        /// API key client secret
+        #[arg(long)]
+        client_secret: Option<String>,
     },
     /// Sync vault from server
     Sync,
@@ -63,6 +76,58 @@ fn prompt_input(prompt: &str) -> Result<String> {
         return Err(anyhow!("Input cannot be empty"));
     }
     Ok(trimmed)
+}
+
+fn push_unique_endpoint(endpoints: &mut Vec<(String, String)>, identity_url: &str, api_url: &str) {
+    if !endpoints
+        .iter()
+        .any(|(id, api)| id == identity_url && api == api_url)
+    {
+        endpoints.push((identity_url.to_string(), api_url.to_string()));
+    }
+}
+
+fn password_login_endpoints(
+    config: &Config,
+    include_official_fallbacks: bool,
+) -> Vec<(String, String)> {
+    let mut endpoints = Vec::new();
+    push_unique_endpoint(&mut endpoints, &config.identity_url, &config.api_url);
+
+    if include_official_fallbacks {
+        push_unique_endpoint(
+            &mut endpoints,
+            "https://identity.bitwarden.com",
+            "https://api.bitwarden.com",
+        );
+        push_unique_endpoint(
+            &mut endpoints,
+            "https://identity.bitwarden.eu",
+            "https://api.bitwarden.eu",
+        );
+    }
+
+    endpoints
+}
+
+fn password_login_client_ids() -> Vec<String> {
+    if let Ok(raw) = std::env::var("BW_PASSWORD_LOGIN_CLIENT_IDS") {
+        let parsed: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    vec![
+        "connector".to_string(),
+        "cli".to_string(),
+        "desktop".to_string(),
+    ]
 }
 
 fn mask_username(username: &str) -> String {
@@ -120,13 +185,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Login { email, server } => {
+        Commands::Login {
+            email,
+            server,
+            apikey,
+            client_id,
+            client_secret,
+        } => {
             let mut config = Config::load().unwrap_or_default();
-
-            let email = match email {
-                Some(e) => e,
-                None => prompt_input("Email: ")?,
-            };
 
             if let Some(ref server) = server {
                 let server = server.trim_end_matches('/');
@@ -134,40 +200,150 @@ async fn main() -> Result<()> {
                 config.api_url = format!("{}/api", server);
             }
 
-            let api = BitwardenApi::new(
-                &config.identity_url,
-                &config.api_url,
-                &config.device_id,
-            );
+            let api = BitwardenApi::new(&config.identity_url, &config.api_url, &config.device_id);
 
-            eprintln!("Fetching KDF parameters...");
-            let prelogin = api.prelogin(&email).await?;
-            let kdf_params = prelogin.to_kdf_params();
+            let sync = if apikey {
+                let client_id = client_id
+                    .or_else(|| std::env::var("BW_CLIENTID").ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(Ok)
+                    .unwrap_or_else(|| prompt_input("API client_id: "))?;
+                let client_secret = client_secret
+                    .or_else(|| std::env::var("BW_CLIENTSECRET").ok())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(Ok)
+                    .unwrap_or_else(|| prompt_password("API client_secret: "))?;
 
-            let password = prompt_password("Master password: ")?;
+                eprintln!("Authenticating with API key...");
+                let token = api.login_with_api_key(&client_id, &client_secret).await?;
+                config.access_token = Some(token.access_token.clone());
+                config.refresh_token = token.refresh_token.clone();
 
-            eprintln!("Deriving master key...");
-            let master_key = MasterKey::derive(&password, &email, &kdf_params)?;
-            let hash = master_key.master_password_hash(&password);
+                eprintln!("Fetching profile and syncing vault...");
+                let sync = api.sync(&token.access_token).await?;
+                let profile_email = sync
+                    .profile
+                    .email
+                    .clone()
+                    .ok_or_else(|| anyhow!("Sync response missing profile email"))?
+                    .trim()
+                    .to_lowercase();
+                let encrypted_key = token
+                    .key
+                    .clone()
+                    .or(sync.profile.key.clone())
+                    .ok_or_else(|| anyhow!("Sync response missing encrypted user key"))?;
 
-            eprintln!("Authenticating...");
-            let token = api.login(&email, &hash).await?;
+                eprintln!("Fetching KDF parameters...");
+                let prelogin = api.prelogin(&profile_email).await?;
 
-            config.email = Some(email);
-            config.access_token = Some(token.access_token);
-            config.refresh_token = token.refresh_token;
-            config.encrypted_user_key = token.key;
-            config.kdf_type = token.kdf.or(Some(prelogin.kdf));
-            config.kdf_iterations = token.kdf_iterations.or(Some(prelogin.kdf_iterations));
-            config.kdf_memory = token.kdf_memory.or(prelogin.kdf_memory);
-            config.kdf_parallelism = token.kdf_parallelism.or(prelogin.kdf_parallelism);
-            config.save()?;
+                config.email = Some(profile_email);
+                config.encrypted_user_key = Some(encrypted_key);
+                config.kdf_type = token.kdf.or(Some(prelogin.kdf));
+                config.kdf_iterations = token.kdf_iterations.or(Some(prelogin.kdf_iterations));
+                config.kdf_memory = token.kdf_memory.or(prelogin.kdf_memory);
+                config.kdf_parallelism = token.kdf_parallelism.or(prelogin.kdf_parallelism);
+                sync
+            } else {
+                let email = match email {
+                    Some(e) => e,
+                    None => prompt_input("Email: ")?,
+                }
+                .trim()
+                .to_lowercase();
 
-            eprintln!("Logged in. Syncing vault...");
+                let password = prompt_password("Master password: ")?;
+                let endpoints = password_login_endpoints(&config, server.is_none());
+                let client_ids = password_login_client_ids();
+                let mut attempt_errors = Vec::new();
+                let mut success: Option<(
+                    String,
+                    String,
+                    bronzewarden::api::PreloginResponse,
+                    bronzewarden::api::TokenResponse,
+                )> = None;
 
-            let sync = api
-                .sync(config.access_token.as_ref().unwrap())
-                .await?;
+                for (identity_url, api_url) in endpoints {
+                    let endpoint_api =
+                        BitwardenApi::new(&identity_url, &api_url, &config.device_id);
+                    eprintln!("Fetching KDF parameters from {}...", identity_url);
+                    let prelogin = match endpoint_api.prelogin(&email).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            attempt_errors.push(format!("{} prelogin failed: {}", identity_url, e));
+                            continue;
+                        }
+                    };
+                    let kdf_params = prelogin.to_kdf_params();
+
+                    eprintln!("Deriving master key...");
+                    let master_key = match MasterKey::derive(&password, &email, &kdf_params) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            attempt_errors
+                                .push(format!("{} key derivation failed: {}", identity_url, e));
+                            continue;
+                        }
+                    };
+                    let hash = master_key.master_password_hash(&password);
+
+                    for cid in &client_ids {
+                        eprintln!("Authenticating via {} (client_id={})...", identity_url, cid);
+                        match endpoint_api.login_with_client_id(&email, &hash, cid).await {
+                            Ok(token) => {
+                                success =
+                                    Some((identity_url.clone(), api_url.clone(), prelogin, token));
+                                break;
+                            }
+                            Err(e) => {
+                                attempt_errors.push(format!(
+                                    "{} login failed (client_id={}): {}",
+                                    identity_url, cid, e
+                                ));
+                            }
+                        }
+                    }
+
+                    if success.is_some() {
+                        break;
+                    }
+                }
+
+                let (identity_url, api_url, prelogin, token) = success.ok_or_else(|| {
+                    let summary = if attempt_errors.is_empty() {
+                        "No attempts were made.".to_string()
+                    } else {
+                        attempt_errors
+                            .iter()
+                            .rev()
+                            .take(6)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    anyhow!(
+                        "Password login failed across fallback attempts.\n{}\n\nTip: try `bronzewarden login --apikey`.",
+                        summary
+                    )
+                })?;
+
+                config.identity_url = identity_url;
+                config.api_url = api_url;
+
+                config.email = Some(email);
+                config.access_token = Some(token.access_token.clone());
+                config.refresh_token = token.refresh_token;
+                config.encrypted_user_key = token.key;
+                config.kdf_type = token.kdf.or(Some(prelogin.kdf));
+                config.kdf_iterations = token.kdf_iterations.or(Some(prelogin.kdf_iterations));
+                config.kdf_memory = token.kdf_memory.or(prelogin.kdf_memory);
+                config.kdf_parallelism = token.kdf_parallelism.or(prelogin.kdf_parallelism);
+
+                eprintln!("Logged in. Syncing vault...");
+                let api =
+                    BitwardenApi::new(&config.identity_url, &config.api_url, &config.device_id);
+                api.sync(&token.access_token).await?
+            };
 
             let login_count = sync
                 .ciphers
@@ -191,11 +367,7 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("Not logged in. Run `bronzewarden login` first."));
             }
 
-            let api = BitwardenApi::new(
-                &config.identity_url,
-                &config.api_url,
-                &config.device_id,
-            );
+            let api = BitwardenApi::new(&config.identity_url, &config.api_url, &config.device_id);
 
             let access_token = config.access_token.as_ref().unwrap().clone();
             let sync_result = api.sync(&access_token).await;
@@ -246,7 +418,12 @@ async fn main() -> Result<()> {
                     .iter()
                     .filter(|c| c.cipher_type == 1 && c.deleted_date.is_none())
                     .count();
-                format!("{} items ({} logins), synced at {}", cache.ciphers.len(), logins, cache.synced_at)
+                format!(
+                    "{} items ({} logins), synced at {}",
+                    cache.ciphers.len(),
+                    logins,
+                    cache.synced_at
+                )
             } else {
                 "no cache".to_string()
             };

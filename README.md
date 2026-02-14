@@ -7,6 +7,7 @@ Born from the discontinuation of [Goldwarden](https://github.com/quexten/goldwar
 ## Features
 
 - **Login** with email + master password (PBKDF2 and Argon2id KDF)
+- **Login with personal API key** (`BW_CLIENTID` + `BW_CLIENTSECRET`)
 - **Sync** vault from Bitwarden servers (official or self-hosted)
 - **Search** credentials by domain, name, or username
 - **Decrypt** vault items locally — your master password never leaves your machine
@@ -30,6 +31,14 @@ cargo install --path .
 ```bash
 # Log in (prompts for master password)
 bronzewarden login -e you@example.com
+
+# API key login (useful if password login is challenged)
+export BW_CLIENTID="user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+export BW_CLIENTSECRET="your_client_secret"
+bronzewarden login --apikey
+
+# Or run without env vars and enter API key interactively
+bronzewarden login --apikey
 
 # Sync vault
 bronzewarden sync

@@ -70,9 +70,7 @@ impl Vault {
 
         let key = self.resolve_key(cipher)?;
 
-        let name = self
-            .decrypt_field(&cipher.name, &key)
-            .unwrap_or_default();
+        let name = self.decrypt_field(&cipher.name, &key).unwrap_or_default();
         let username = self
             .decrypt_field(&login.username, &key)
             .unwrap_or_default();
@@ -116,7 +114,10 @@ impl Vault {
 
             let matches = cred.name.to_lowercase().contains(&query_lower)
                 || cred.username.to_lowercase().contains(&query_lower)
-                || cred.uris.iter().any(|u| u.to_lowercase().contains(&query_lower));
+                || cred
+                    .uris
+                    .iter()
+                    .any(|u| u.to_lowercase().contains(&query_lower));
 
             if matches {
                 results.push(cred);

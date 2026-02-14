@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{KdfParams, KdfType};
 
-const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const B64_AUTH_EMAIL: base64::engine::GeneralPurpose =
+    base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 pub struct BitwardenApi {
     client: Client,
@@ -164,6 +165,7 @@ impl BitwardenApi {
     }
 
     pub async fn prelogin(&self, email: &str) -> Result<PreloginResponse> {
+        let email = email.trim().to_lowercase();
         let url = format!("{}/accounts/prelogin", self.identity_url);
         let resp = self
             .client
@@ -180,13 +182,20 @@ impl BitwardenApi {
         Ok(resp.json().await?)
     }
 
-    pub async fn login(
+    pub async fn login(&self, email: &str, master_password_hash: &str) -> Result<TokenResponse> {
+        self.login_with_client_id(email, master_password_hash, "connector")
+            .await
+    }
+
+    pub async fn login_with_client_id(
         &self,
         email: &str,
         master_password_hash: &str,
+        client_id: &str,
     ) -> Result<TokenResponse> {
         let url = format!("{}/connect/token", self.identity_url);
-        let auth_email = B64.encode(email.as_bytes());
+        let normalized_email = email.trim().to_lowercase();
+        let auth_email = B64_AUTH_EMAIL.encode(normalized_email.as_bytes());
 
         let resp = self
             .client
@@ -194,13 +203,50 @@ impl BitwardenApi {
             .header("Auth-Email", &auth_email)
             .form(&[
                 ("scope", "api offline_access"),
-                ("client_id", "connector"),
+                ("client_id", client_id),
                 ("deviceType", "10"),
                 ("deviceIdentifier", &self.device_id),
                 ("deviceName", "bronzewarden"),
                 ("grant_type", "password"),
-                ("username", email),
+                ("username", normalized_email.as_str()),
                 ("password", master_password_hash),
+            ])
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if let Ok(err) = serde_json::from_str::<ErrorResponse>(&text) {
+                err.error_description
+                    .or(err.message)
+                    .or(err.error_model.and_then(|m| m.message))
+                    .unwrap_or(text.clone())
+            } else {
+                text
+            };
+            return Err(anyhow!("Login failed (client_id={}): {}", client_id, msg));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    pub async fn login_with_api_key(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+    ) -> Result<TokenResponse> {
+        let url = format!("{}/connect/token", self.identity_url);
+        let resp = self
+            .client
+            .post(&url)
+            .form(&[
+                ("scope", "api"),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("grant_type", "client_credentials"),
+                ("deviceType", "10"),
+                ("deviceIdentifier", &self.device_id),
+                ("deviceName", "bronzewarden"),
             ])
             .send()
             .await?;
@@ -213,9 +259,9 @@ impl BitwardenApi {
                     .or(err.message)
                     .or(err.error_model.and_then(|m| m.message))
                     .unwrap_or(text.clone());
-                return Err(anyhow!("Login failed: {}", msg));
+                return Err(anyhow!("API key login failed: {}", msg));
             }
-            return Err(anyhow!("Login failed: {}", text));
+            return Err(anyhow!("API key login failed: {}", text));
         }
 
         Ok(resp.json().await?)

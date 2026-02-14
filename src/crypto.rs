@@ -39,7 +39,7 @@ pub struct KdfParams {
 
 impl MasterKey {
     pub fn derive(password: &str, email: &str, params: &KdfParams) -> Result<Self> {
-        let email_lower = email.to_lowercase();
+        let email_lower = email.trim().to_lowercase();
         let mut key = [0u8; 32];
 
         match params.kdf_type {
@@ -75,12 +75,7 @@ impl MasterKey {
 
     pub fn master_password_hash(&self, password: &str) -> String {
         let mut hash = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(
-            &self.key,
-            password.as_bytes(),
-            1,
-            &mut hash,
-        );
+        pbkdf2::pbkdf2_hmac::<Sha256>(&self.key, password.as_bytes(), 1, &mut hash);
         B64.encode(hash)
     }
 
@@ -112,7 +107,10 @@ impl EncString {
             0 => {
                 let parts: Vec<&str> = rest.split('|').collect();
                 if parts.len() != 2 {
-                    return Err(anyhow!("Type 0 enc string: expected 2 parts, got {}", parts.len()));
+                    return Err(anyhow!(
+                        "Type 0 enc string: expected 2 parts, got {}",
+                        parts.len()
+                    ));
                 }
                 let iv = B64.decode(parts[0])?;
                 let ct = B64.decode(parts[1])?;
@@ -121,7 +119,10 @@ impl EncString {
             2 => {
                 let parts: Vec<&str> = rest.split('|').collect();
                 if parts.len() != 3 {
-                    return Err(anyhow!("Type 2 enc string: expected 3 parts, got {}", parts.len()));
+                    return Err(anyhow!(
+                        "Type 2 enc string: expected 3 parts, got {}",
+                        parts.len()
+                    ));
                 }
                 let iv = B64.decode(parts[0])?;
                 let ct = B64.decode(parts[1])?;
@@ -142,10 +143,7 @@ impl EncString {
     pub fn decrypt_to_key(&self, key: &SymmetricKey) -> Result<SymmetricKey> {
         let bytes = self.decrypt(key)?;
         if bytes.len() != 64 {
-            return Err(anyhow!(
-                "Expected 64-byte key, got {} bytes",
-                bytes.len()
-            ));
+            return Err(anyhow!("Expected 64-byte key, got {} bytes", bytes.len()));
         }
         let mut enc_key = [0u8; 32];
         let mut mac_key = [0u8; 32];
@@ -156,8 +154,8 @@ impl EncString {
 }
 
 fn verify_hmac(mac_key: &[u8], iv: &[u8], ct: &[u8], expected_mac: &[u8]) -> Result<()> {
-    let mut mac = HmacSha256::new_from_slice(mac_key)
-        .map_err(|e| anyhow!("HMAC init error: {}", e))?;
+    let mut mac =
+        HmacSha256::new_from_slice(mac_key).map_err(|e| anyhow!("HMAC init error: {}", e))?;
     mac.update(iv);
     mac.update(ct);
     mac.verify_slice(expected_mac)

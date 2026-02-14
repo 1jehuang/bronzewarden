@@ -128,7 +128,9 @@ impl Config {
     pub fn load_vault_cache() -> Result<VaultCache> {
         let path = Self::vault_cache_path()?;
         if !path.exists() {
-            return Err(anyhow!("No vault cache found. Run `bronzewarden sync` first."));
+            return Err(anyhow!(
+                "No vault cache found. Run `bronzewarden sync` first."
+            ));
         }
         let content = std::fs::read_to_string(&path)?;
         Ok(serde_json::from_str(&content)?)
