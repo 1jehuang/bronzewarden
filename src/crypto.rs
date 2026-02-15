@@ -80,7 +80,8 @@ impl MasterKey {
     }
 
     pub fn stretch(&self) -> Result<SymmetricKey> {
-        let hk = Hkdf::<Sha256>::new(None, &self.key);
+        let hk = Hkdf::<Sha256>::from_prk(&self.key)
+            .map_err(|e| anyhow!("HKDF from_prk: {}", e))?;
         let mut enc_key = [0u8; 32];
         let mut mac_key = [0u8; 32];
         hk.expand(b"enc", &mut enc_key)
