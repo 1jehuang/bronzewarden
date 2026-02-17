@@ -57,6 +57,10 @@ enum Commands {
     List,
     /// Log out and clear stored data
     Logout,
+    /// Set up fingerprint unlock (caches encrypted key locally)
+    SetupFingerprint,
+    /// Remove cached fingerprint unlock key
+    RemoveFingerprint,
 }
 
 fn prompt_password(prompt: &str) -> Result<String> {
@@ -521,7 +525,73 @@ async fn main() -> Result<()> {
                 std::fs::remove_file(&cache_path)?;
             }
 
+            bronzewarden::protected_key::remove_protected_key().ok();
             eprintln!("Logged out and cleared vault cache.");
+        }
+
+        Commands::SetupFingerprint => {
+            let config = Config::load()?;
+            let email = config
+                .email
+                .as_ref()
+                .ok_or_else(|| anyhow!("Not logged in. Run `bronzewarden login` first."))?;
+            let encrypted_key = config
+                .encrypted_user_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("No user key stored. Run `bronzewarden login` first."))?;
+            let kdf_params = config
+                .kdf_params()
+                .ok_or_else(|| anyhow!("No KDF params stored."))?;
+
+            if bronzewarden::protected_key::has_protected_key() {
+                eprint!("Fingerprint unlock is already set up. Re-configure? [y/N] ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    eprintln!("Cancelled.");
+                    return Ok(());
+                }
+            }
+
+            eprintln!("Enter your master password to set up fingerprint unlock.");
+            eprintln!("This will be the LAST time you need to type it.");
+            let password = prompt_password("Master password: ")?;
+
+            eprintln!("Deriving key...");
+            let master_key = MasterKey::derive(&password, email, &kdf_params)?;
+            let stretched = master_key.stretch()?;
+            let user_key = EncString(encrypted_key.clone()).decrypt_to_key(&stretched)?;
+
+            // Verify the key works by trying to decrypt something from the vault
+            if let Ok(cache) = Config::load_vault_cache() {
+                let sync = SyncResponse {
+                    profile: bronzewarden::api::SyncProfile {
+                        id: String::new(),
+                        email: config.email.clone(),
+                        key: config.encrypted_user_key.clone(),
+                        private_key: None,
+                    },
+                    ciphers: cache.ciphers,
+                    folders: None,
+                };
+                let vault = Vault::new(user_key.clone(), &sync);
+                let count = vault.login_count();
+                eprintln!("✓ Key verified ({} logins accessible)", count);
+            }
+
+            bronzewarden::protected_key::store_protected_key(&user_key)?;
+            eprintln!("✓ Fingerprint unlock configured!");
+            eprintln!("  The vault can now be unlocked with fingerprint only.");
+            eprintln!("  Protected key stored at ~/.config/bronzewarden/protected_key.json");
+        }
+
+        Commands::RemoveFingerprint => {
+            if bronzewarden::protected_key::has_protected_key() {
+                bronzewarden::protected_key::remove_protected_key()?;
+                eprintln!("✓ Fingerprint unlock removed.");
+            } else {
+                eprintln!("Fingerprint unlock is not configured.");
+            }
         }
     }
 
