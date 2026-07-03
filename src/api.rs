@@ -110,6 +110,41 @@ pub struct SyncFolder {
     pub name: Option<String>,
 }
 
+/// Request body for creating a login cipher. All string fields must already
+/// be Bitwarden enc strings (encrypted client-side before sending).
+#[derive(Debug, Serialize)]
+pub struct CreateCipherRequest {
+    #[serde(rename = "type")]
+    pub cipher_type: u32,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub login: CreateCipherLogin,
+    #[serde(rename = "folderId")]
+    pub folder_id: Option<String>,
+    pub favorite: bool,
+    pub reprompt: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCipherLogin {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uris: Option<Vec<CreateCipherUri>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCipherUri {
+    pub uri: String,
+    #[serde(rename = "match")]
+    pub match_type: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     #[serde(rename = "error_description")]
@@ -302,6 +337,40 @@ impl BitwardenApi {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("Sync failed ({}): {}", status, text));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Create a new cipher (vault item). This is intentionally the only
+    /// mutating vault endpoint bronzewarden supports: no edit, no delete.
+    pub async fn create_cipher(
+        &self,
+        access_token: &str,
+        request: &CreateCipherRequest,
+    ) -> Result<SyncCipher> {
+        let url = format!("{}/ciphers", self.api_url);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(access_token)
+            .header("Device-Type", "10")
+            .json(request)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if let Ok(err) = serde_json::from_str::<ErrorResponse>(&text) {
+                err.error_description
+                    .or(err.message)
+                    .or(err.error_model.and_then(|m| m.message))
+                    .unwrap_or(text.clone())
+            } else {
+                text
+            };
+            return Err(anyhow!("Create cipher failed ({}): {}", status, msg));
         }
 
         Ok(resp.json().await?)

@@ -53,9 +53,12 @@ impl Default for Config {
 
 impl Config {
     pub fn config_dir() -> Result<PathBuf> {
-        let dir = dirs::config_dir()
-            .ok_or_else(|| anyhow!("Could not determine config directory"))?
-            .join("bronzewarden");
+        let dir = match std::env::var_os("BRONZEWARDEN_CONFIG_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => dirs::config_dir()
+                .ok_or_else(|| anyhow!("Could not determine config directory"))?
+                .join("bronzewarden"),
+        };
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }

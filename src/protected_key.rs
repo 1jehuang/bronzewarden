@@ -12,7 +12,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-use crate::crypto::SymmetricKey;
+use crate::crypto::{generate_random_bytes, SymmetricKey};
 
 #[derive(Serialize, Deserialize)]
 pub struct ProtectedKeyFile {
@@ -27,22 +27,14 @@ pub struct ProtectedKeyFile {
 }
 
 fn protected_key_path() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow!("No config directory"))?
-        .join("bronzewarden");
+    let dir = match std::env::var_os("BRONZEWARDEN_CONFIG_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => dirs::config_dir()
+            .ok_or_else(|| anyhow!("No config directory"))?
+            .join("bronzewarden"),
+    };
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("protected_key.json"))
-}
-
-fn generate_random_bytes<const N: usize>() -> [u8; N] {
-    use std::fs::File;
-    use std::io::Read;
-    let mut buf = [0u8; N];
-    File::open("/dev/urandom")
-        .expect("Failed to open /dev/urandom")
-        .read_exact(&mut buf)
-        .expect("Failed to read random bytes");
-    buf
 }
 
 fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
@@ -184,6 +176,9 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("bw-test-{}", std::process::id()));
+        std::env::set_var("BRONZEWARDEN_CONFIG_DIR", &tmp);
+
         let key = SymmetricKey {
             enc_key: generate_random_bytes(),
             mac_key: generate_random_bytes(),
@@ -196,5 +191,7 @@ mod tests {
         assert_eq!(key.mac_key, loaded.mac_key);
 
         remove_protected_key().unwrap();
+        std::env::remove_var("BRONZEWARDEN_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

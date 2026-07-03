@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod crypto;
+pub mod fingerprint;
 pub mod protected_key;
 pub mod vault;
 

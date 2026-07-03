@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use bronzewarden::api::BitwardenApi;
 use bronzewarden::api::SyncResponse;
 use bronzewarden::config::Config;
-use bronzewarden::crypto::{EncString, MasterKey};
+use bronzewarden::crypto::{EncString, MasterKey, SymmetricKey};
+use bronzewarden::fingerprint::UnlockContext;
 use bronzewarden::vault::Vault;
 
 #[derive(Parser)]
@@ -52,9 +53,45 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+        /// Why the vault is being accessed (required for fingerprint unlock,
+        /// shown in the desktop notification)
+        #[arg(long, short = 'i')]
+        intent: Option<String>,
     },
     /// List all logins (names only)
-    List,
+    List {
+        /// Why the vault is being accessed (required for fingerprint unlock,
+        /// shown in the desktop notification)
+        #[arg(long, short = 'i')]
+        intent: Option<String>,
+    },
+    /// Create a new login item (create-only: bronzewarden has no edit/delete)
+    Create {
+        /// Item name (e.g. "GitHub")
+        name: String,
+        /// Login username
+        #[arg(short, long)]
+        username: Option<String>,
+        /// Login password (omit to be prompted; use --generate to autogenerate)
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Generate a random password instead of prompting
+        #[arg(long, conflicts_with = "password")]
+        generate: bool,
+        /// Generated password length
+        #[arg(long, default_value_t = 24, requires = "generate")]
+        length: usize,
+        /// URI the login applies to (repeatable)
+        #[arg(long = "uri")]
+        uris: Vec<String>,
+        /// Secure note attached to the item
+        #[arg(long)]
+        notes: Option<String>,
+        /// Why the vault is being accessed (required for fingerprint unlock,
+        /// shown in the desktop notification)
+        #[arg(long, short = 'i')]
+        intent: Option<String>,
+    },
     /// Log out and clear stored data
     Logout,
     /// Set up fingerprint unlock (caches encrypted key locally)
@@ -151,7 +188,29 @@ fn mask_username(username: &str) -> String {
     }
 }
 
-fn unlock_vault(config: &Config) -> Result<(Vault, SyncResponse)> {
+/// Obtain the decrypted user key, preferring fingerprint unlock when set up.
+///
+/// Fingerprint unlock requires an explicit intent; it is surfaced in the
+/// desktop notification so the user can audit every vault access.
+fn obtain_user_key(
+    config: &Config,
+    intent: Option<&str>,
+    operation: &str,
+) -> Result<SymmetricKey> {
+    if bronzewarden::protected_key::has_protected_key() {
+        let intent = intent.ok_or_else(|| {
+            anyhow!(
+                "Fingerprint unlock requires --intent. Example:\n  bronzewarden {} --intent \"log in to github.com\"",
+                operation
+            )
+        })?;
+        let ctx = UnlockContext {
+            intent: intent.to_string(),
+            operation: operation.to_string(),
+        };
+        return bronzewarden::fingerprint::verify_and_unlock(&ctx);
+    }
+
     let email = config
         .email
         .as_ref()
@@ -167,7 +226,18 @@ fn unlock_vault(config: &Config) -> Result<(Vault, SyncResponse)> {
     let password = prompt_password("Master password: ")?;
     let master_key = MasterKey::derive(&password, email, &kdf_params)?;
     let stretched = master_key.stretch()?;
-    let user_key = EncString(encrypted_key.clone()).decrypt_to_key(&stretched)?;
+    EncString(encrypted_key.clone()).decrypt_to_key(&stretched)
+}
+
+fn unlock_vault(
+    config: &Config,
+    intent: Option<&str>,
+    operation: &str,
+) -> Result<(Vault, SyncResponse)> {
+    if !config.is_logged_in() && config.email.is_none() {
+        return Err(anyhow!("Not logged in. Run `bronzewarden login` first."));
+    }
+    let user_key = obtain_user_key(config, intent, operation)?;
 
     let cache = Config::load_vault_cache()?;
     let sync = SyncResponse {
@@ -182,6 +252,57 @@ fn unlock_vault(config: &Config) -> Result<(Vault, SyncResponse)> {
     };
 
     Ok((Vault::new(user_key, &sync), sync))
+}
+
+fn generate_password(length: usize) -> Result<String> {
+    // No ambiguous characters; mix of upper/lower/digits/symbols.
+    const CHARSET: &[u8] =
+        b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%^&*-_=+";
+    if length < 8 {
+        return Err(anyhow!("Generated password length must be at least 8"));
+    }
+    let mut out = String::with_capacity(length);
+    let mut buf = vec![0u8; length * 2];
+    // Rejection sampling to avoid modulo bias.
+    let max_valid = (u8::MAX as usize / CHARSET.len()) * CHARSET.len();
+    while out.len() < length {
+        bronzewarden::crypto::fill_random(&mut buf)?;
+        for &b in &buf {
+            if (b as usize) < max_valid {
+                out.push(CHARSET[b as usize % CHARSET.len()] as char);
+                if out.len() == length {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Get a usable access token, refreshing (and persisting) if needed.
+async fn valid_access_token(config: &mut Config, api: &BitwardenApi) -> Result<String> {
+    let access_token = config
+        .access_token
+        .clone()
+        .ok_or_else(|| anyhow!("Not logged in. Run `bronzewarden login` first."))?;
+
+    // Cheap validity probe: sync with the current token.
+    if api.sync(&access_token).await.is_ok() {
+        return Ok(access_token);
+    }
+
+    let refresh = config
+        .refresh_token
+        .clone()
+        .ok_or_else(|| anyhow!("Token expired and no refresh token. Run `bronzewarden login`."))?;
+    eprintln!("Token expired, refreshing...");
+    let new_token = api.refresh_token(&refresh).await?;
+    config.access_token = Some(new_token.access_token.clone());
+    if let Some(rt) = new_token.refresh_token {
+        config.refresh_token = Some(rt);
+    }
+    config.save()?;
+    Ok(new_token.access_token)
 }
 
 #[tokio::main]
@@ -443,9 +564,11 @@ async fn main() -> Result<()> {
             query,
             password,
             json,
+            intent,
         } => {
             let config = Config::load()?;
-            let (vault, _) = unlock_vault(&config)?;
+            let operation = format!("get {}", query);
+            let (vault, _) = unlock_vault(&config, intent.as_deref(), &operation)?;
 
             let results = vault.find_by_domain(&query);
             let results = if results.is_empty() {
@@ -492,9 +615,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::List => {
+        Commands::List { intent } => {
             let config = Config::load()?;
-            let (vault, _) = unlock_vault(&config)?;
+            let (vault, _) = unlock_vault(&config, intent.as_deref(), "list")?;
 
             let cache = Config::load_vault_cache()?;
             let mut count = 0;
@@ -513,6 +636,91 @@ async fn main() -> Result<()> {
                 }
             }
             eprintln!("({} logins)", count);
+        }
+
+        Commands::Create {
+            name,
+            username,
+            password,
+            generate,
+            length,
+            uris,
+            notes,
+            intent,
+        } => {
+            let mut config = Config::load()?;
+            if !config.is_logged_in() {
+                return Err(anyhow!("Not logged in. Run `bronzewarden login` first."));
+            }
+
+            let operation = format!("create {}", name);
+            let user_key = obtain_user_key(&config, intent.as_deref(), &operation)?;
+
+            let (plaintext_password, was_generated) = if generate {
+                (Some(generate_password(length)?), true)
+            } else if let Some(p) = password {
+                (Some(p), false)
+            } else {
+                (Some(prompt_password("Password for new item: ")?), false)
+            };
+
+            let enc_field = |value: &str| -> Result<String> {
+                Ok(EncString::encrypt(value.as_bytes(), &user_key)?.0)
+            };
+
+            let request = bronzewarden::api::CreateCipherRequest {
+                cipher_type: 1,
+                name: enc_field(&name)?,
+                notes: notes.as_deref().map(enc_field).transpose()?,
+                login: bronzewarden::api::CreateCipherLogin {
+                    username: username.as_deref().map(enc_field).transpose()?,
+                    password: plaintext_password.as_deref().map(enc_field).transpose()?,
+                    totp: None,
+                    uris: if uris.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            uris.iter()
+                                .map(|u| {
+                                    Ok(bronzewarden::api::CreateCipherUri {
+                                        uri: enc_field(u)?,
+                                        match_type: None,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        )
+                    },
+                },
+                folder_id: None,
+                favorite: false,
+                reprompt: 0,
+            };
+
+            let api = BitwardenApi::new(&config.identity_url, &config.api_url, &config.device_id);
+            let access_token = valid_access_token(&mut config, &api).await?;
+
+            eprintln!("Creating item '{}'...", name);
+            let created = api.create_cipher(&access_token, &request).await?;
+            eprintln!("✓ Created item '{}' (id: {})", name, created.id);
+            if was_generated {
+                println!(
+                    "{}",
+                    plaintext_password.expect("generated password present")
+                );
+                eprintln!("(generated password printed to stdout)");
+            }
+
+            // Re-sync so the local cache includes the new item.
+            match api.sync(&access_token).await {
+                Ok(sync) => {
+                    config.save_vault_cache(&sync.ciphers)?;
+                    eprintln!("✓ Vault re-synced ({} items)", sync.ciphers.len());
+                }
+                Err(e) => {
+                    eprintln!("Warning: item created but re-sync failed: {}", e);
+                    eprintln!("Run `bronzewarden sync` to refresh the local cache.");
+                }
+            }
         }
 
         Commands::Logout => {

@@ -1,14 +1,32 @@
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// Fill a fixed-size array with bytes from the OS CSPRNG.
+pub fn generate_random_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    fill_random(&mut buf).expect("Failed to read from OS random source");
+    buf
+}
+
+/// Fill a buffer with bytes from the OS CSPRNG.
+pub fn fill_random(buf: &mut [u8]) -> Result<()> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| anyhow!("Failed to open /dev/urandom: {}", e))?;
+    f.read_exact(buf)
+        .map_err(|e| anyhow!("Failed to read random bytes: {}", e))?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct SymmetricKey {
@@ -93,6 +111,25 @@ impl MasterKey {
 }
 
 impl EncString {
+    /// Encrypt plaintext as a type-2 enc string (AES-256-CBC + HMAC-SHA256).
+    pub fn encrypt(plaintext: &[u8], key: &SymmetricKey) -> Result<Self> {
+        let iv: [u8; 16] = generate_random_bytes();
+        let ct = aes_cbc_encrypt(&key.enc_key, &iv, plaintext);
+
+        let mut mac = HmacSha256::new_from_slice(&key.mac_key)
+            .map_err(|e| anyhow!("HMAC init error: {}", e))?;
+        mac.update(&iv);
+        mac.update(&ct);
+        let mac_bytes = mac.finalize().into_bytes();
+
+        Ok(EncString(format!(
+            "2.{}|{}|{}",
+            B64.encode(iv),
+            B64.encode(&ct),
+            B64.encode(mac_bytes)
+        )))
+    }
+
     pub fn decrypt(&self, key: &SymmetricKey) -> Result<Vec<u8>> {
         let s = &self.0;
 
@@ -164,6 +201,11 @@ fn verify_hmac(mac_key: &[u8], iv: &[u8], ct: &[u8], expected_mac: &[u8]) -> Res
     Ok(())
 }
 
+fn aes_cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    let encryptor = Aes256CbcEnc::new(key.into(), iv.into());
+    encryptor.encrypt_padded_vec_mut::<Pkcs7>(plaintext)
+}
+
 fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8], ct: &[u8]) -> Result<Vec<u8>> {
     let iv_arr: [u8; 16] = iv
         .try_into()
@@ -195,5 +237,29 @@ mod tests {
         let stretched = mk.stretch().unwrap();
         assert_ne!(stretched.enc_key, [0u8; 32]);
         assert_ne!(stretched.mac_key, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() {
+        let key = SymmetricKey {
+            enc_key: generate_random_bytes(),
+            mac_key: generate_random_bytes(),
+        };
+        let enc = EncString::encrypt(b"hunter2 secret", &key).unwrap();
+        assert!(enc.0.starts_with("2."));
+        let dec = enc.decrypt(&key).unwrap();
+        assert_eq!(dec, b"hunter2 secret");
+    }
+
+    #[test]
+    fn test_encrypt_tamper_fails_hmac() {
+        let key = SymmetricKey {
+            enc_key: generate_random_bytes(),
+            mac_key: generate_random_bytes(),
+        };
+        let enc = EncString::encrypt(b"data", &key).unwrap();
+        let mut wrong_key = key.clone();
+        wrong_key.mac_key[0] ^= 1;
+        assert!(enc.decrypt(&wrong_key).is_err());
     }
 }
